@@ -1,127 +1,104 @@
-import pygame
-import random
-
-pygame.init()
-
-BLACK = (0, 0, 0)
-GREY = (128, 128, 128)
-YELLOW = (255, 255, 0)
-
-WIDTH, HEIGHT = 600, 600
-TILE_SIZE = 15
-GRID_WIDTH = WIDTH // TILE_SIZE
-GRID_HEIGHT = HEIGHT // TILE_SIZE
-FPS = 60
-
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-
-clock = pygame.time.Clock()
-
-def gen(num):
-    return set([(random.randrange(0, GRID_HEIGHT), random.randrange(0, GRID_WIDTH)) for _ in range(num)])
-
-def draw_grid(positions):
-    for position in positions:
-        col, row = position
-        top_left = (col * TILE_SIZE, row * TILE_SIZE)
-        pygame.draw.rect(screen, YELLOW, (*top_left, TILE_SIZE, TILE_SIZE))
-
-    for row in range(GRID_HEIGHT):
-        pygame.draw.line(screen, BLACK, (0, row * TILE_SIZE), (WIDTH, row * TILE_SIZE))
-
-    for col in range(GRID_WIDTH):
-        pygame.draw.line(screen, BLACK, (col * TILE_SIZE, 0), (col * TILE_SIZE, HEIGHT))
-
-def adjust_grid(positions):
-    all_neighbors = set()
-    new_positions = set()
-
-    for position in positions:
-        neighbors = get_neighbors(position)
-        all_neighbors.update(neighbors)
-
-        neighbors = list(filter(lambda x: x in positions, neighbors))
-
-        if len(neighbors) in [2, 3]:
-            new_positions.add(position)
-    
-    for position in all_neighbors:
-        neighbors = get_neighbors(position)
-        neighbors = list(filter(lambda x: x in positions, neighbors))
-
-        if len(neighbors) == 3:
-            new_positions.add(position)
-    
-    return new_positions
-
-def get_neighbors(pos):
-    x, y = pos
-    neighbors = []
-    for dx in [-1, 0, 1]:
-        if x + dx < 0 or x + dx > GRID_WIDTH:
-            continue
-        for dy in [-1, 0, 1]:
-            if y + dy < 0 or y + dy > GRID_HEIGHT:
-                continue
-            if dx == 0 and dy == 0:
-                continue
-
-            neighbors.append((x + dx, y + dy))
-    
-    return neighbors
-
-def main():
-    running = True
-    playing = False
-    count = 0
-    update_freq = 10
-
-    positions = set()
-    while running:
-        clock.tick(FPS)
-
-        if playing:
-            count += 1
-        
-        if count >= update_freq:
-            count = 0
-            positions = adjust_grid(positions)
-
-        pygame.display.set_caption("Playing" if playing else "Paused")
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                x, y = pygame.mouse.get_pos()
-                col = x // TILE_SIZE
-                row = y // TILE_SIZE
-                pos = (col, row)
-
-                if pos in positions:
-                    positions.remove(pos)
-                else:
-                    positions.add(pos)
-            
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:
-                    playing = not playing
-                
-                if event.key == pygame.K_c:
-                    positions = set()
-                    playing = False
-                    count = 0
-                
-                if event.key == pygame.K_g:
-                    positions = gen(random.randrange(4, 10) * GRID_WIDTH)
-    
-        screen.fill(GREY)
-        draw_grid(positions)
-        pygame.display.update()
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
 
 
-    pygame.quit()
+class GameOfLifeEnv(gym.Env):
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 10}
+
+    def __init__(self, grid_size=40, max_steps=200, render_mode=None):
+        super().__init__()
+        self.grid_size   = grid_size
+        self.max_steps   = max_steps
+        self.render_mode = render_mode
+        self.grid        = np.zeros((grid_size, grid_size), dtype=np.float32)
+
+        # float32 required by most RL libraries (SB3, RLlib, etc.)
+        self.observation_space = spaces.Box(0.0, 1.0, (grid_size, grid_size), dtype=np.float32)
+
+        # agent picks any cell by flat index: 0 to grid_size*grid_size-1
+        self.action_space = spaces.Discrete(grid_size * grid_size)
+
+    def _tick(self):
+        """Advance the Game of Life by one step using vectorized numpy."""
+        p = np.pad(self.grid, 1, mode='constant')
+        n = (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:] +
+             p[1:-1, :-2] +                p[1:-1, 2:] +
+             p[2:,   :-2] + p[2:,   1:-1] + p[2:,  2:])
+        self.grid = (
+            ((self.grid == 1) & ((n == 2) | (n == 3))) |
+            ((self.grid == 0) &  (n == 3))
+        ).astype(np.float32)
+
+    def reset(self, seed=None, options=None):
+        """Start a new episode with a random grid."""
+        super().reset(seed=seed)
+        self.grid       = self.np_random.integers(0, 2, (self.grid_size, self.grid_size)).astype(np.float32)
+        self.step_count = 0
+        self.prev_live  = int(self.grid.sum())
+        return self.grid.copy(), {}
+
+    def step(self, action):
+        """
+        Agent toggles one cell, then the game ticks forward.
+
+        action : int — flat index of the cell to toggle (row * grid_size + col)
+        returns: obs, reward, terminated, truncated, info
+        reward : change in live cell count this step (positive = more cells alive)
+        """
+        # 1. toggle the chosen cell
+        row, col = divmod(int(action), self.grid_size)
+        self.grid[row, col] = 1.0 - self.grid[row, col]
+
+        # 2. advance game of life
+        self._tick()
+        self.step_count += 1
+
+        # 3. reward = delta in live cells
+        live           = int(self.grid.sum())
+        reward         = float(live - self.prev_live)
+        self.prev_live = live
+
+        # 4. episode end conditions
+        terminated = live == 0                       # all cells dead
+        truncated  = self.step_count >= self.max_steps
+
+        return self.grid.copy(), reward, terminated, truncated, {"live_cells": live}
+
+    def render(self):
+        """Return an RGB image of the current grid (only when render_mode='rgb_array')."""
+        if self.render_mode == "rgb_array":
+            img = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.uint8)
+            img[self.grid == 1] = [255, 255, 0]    # yellow = alive
+            img[self.grid == 0] = [128, 128, 128]  # grey   = dead
+            return img
+
+    def close(self):
+        pass
+
 
 if __name__ == "__main__":
-    main()
+    from gymnasium.utils.env_checker import check_env
+
+    print("=== gymnasium check_env ===")
+    env = GameOfLifeEnv(grid_size=20, max_steps=50)
+    check_env(env, skip_render_check=False)
+    print("PASSED\n")
+
+    print("=== functional test (random agent) ===")
+    env = GameOfLifeEnv(grid_size=20, max_steps=50)
+    obs, _ = env.reset()
+    print(f"obs dtype : {obs.dtype}")
+    print(f"obs shape : {obs.shape}")
+    print(f"action space : {env.action_space}\n")
+
+    for i in range(50):
+        action = env.action_space.sample()
+        obs, reward, terminated, truncated, info = env.step(action)
+        print(f"step={i+1:02d}  live={info['live_cells']:4d}  reward={reward:+.1f}")
+        if terminated or truncated:
+            reason = "terminated (all dead)" if terminated else "truncated (max steps)"
+            print(f"\nEpisode ended: {reason}")
+            break
+
+    env.close()
